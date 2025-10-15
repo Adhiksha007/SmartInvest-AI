@@ -214,6 +214,7 @@ if 'selected_tickers' in st.session_state and st.session_state['selected_tickers
                     pipeline.fit_regime(features)
                     pipeline.fit_risk(prices_df)
                     results = pipeline.run_pipeline(price_df=prices_df, feature_matrix=features, macro_df=sentiment_wide)
+                    results['sentiment'] = {'df': sentiment_df, 'daily_pivot': sentiment_wide}
                     weights = pipeline.generate_signals(features, prices_df, sentiment_wide, top_n=2)
 
                     # Store forecasts in session_state

@@ -12,3 +12,4 @@ arch
 transformers
 stable-baselines3 
 gym
+feedparser

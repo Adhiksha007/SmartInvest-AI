@@ -5,9 +5,11 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 import warnings
 import warnings
+import torch
 warnings.filterwarnings("ignore")
 import feedparser
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from scipy.special import softmax
 
 try:
@@ -167,75 +169,111 @@ class AIForecasterLGB:
 """#2. Sentiment Analyzer (FinBERT)"""
 class SentimentAnalyzer:
     """
-    Sentiment analyzer using FinBERT.
-    - Fetches Google News headlines per ticker.
-    - Computes sentiment = P(pos) - P(neg).
-    - Can return raw per-text scores or aggregated daily scores.
+    Optimized Sentiment analyzer using FinBERT with concurrency for I/O 
+    and hardware acceleration for compute.
     """
 
     def __init__(self, model_name: str = "ProsusAI/finbert"):
         self.model_name = model_name
+        # 1. HARDWARE OPTIMIZATION: Detect and set device
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Loading FinBERT model on device: {self.device}")
+        
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self.model = AutoModelForSequenceClassification.from_pretrained(self.model_name)
+        # Move model to the detected device
+        self.model = AutoModelForSequenceClassification.from_pretrained(self.model_name).to(self.device)
 
     def _score_texts(self, texts: list) -> np.ndarray:
-        """Return sentiment scores (P(pos) - P(neg)) for a list of texts."""
+        """Return sentiment scores (P(pos) - P(neg)) for a list of texts (batch processing)."""
+        
+        # Move inputs to the correct device
         inputs = self.tokenizer(texts, return_tensors="pt", padding=True, truncation=True)
-        outputs = self.model(**inputs)
-        probs = softmax(outputs.logits.detach().numpy(), axis=1)
-        pos = probs[:, 2]   # positive class
-        neg = probs[:, 0]   # negative class
-        return pos - neg    # same as pipeline version
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        
+        # Inference
+        with torch.no_grad(): # Disable gradient calculations to save memory and speed up inference
+            outputs = self.model(**inputs)
+            
+        probs = softmax(outputs.logits.cpu().numpy(), axis=1) # Move logits to CPU for numpy/scipy
+        pos = probs[:, 2]  # positive class
+        neg = probs[:, 0]  # negative class
+        return pos - neg
 
-
-
-    def _score_single(self, text: str) -> float:
-        """Return sentiment score for a single text."""
-        inputs = self.tokenizer(text, return_tensors="pt", truncation=True)
-        logits = self.model(**inputs).logits[0].detach().numpy()
-        probs = softmax(logits)
-        return float(probs[2] - probs[0])
-
-    def fetch_headlines(self, ticker: str):
-        """Fetch news headlines for a ticker via Google RSS."""
+    # _score_single is now redundant as we only use _score_texts for efficient batching
+    
+    # New helper function for concurrent fetching
+    @staticmethod
+    def _fetch_single_feed(ticker: str):
+        """Helper for ThreadPoolExecutor to fetch one feed."""
+        # This is the I/O-bound part
         feed = feedparser.parse(f"https://news.google.com/rss/search?q={ticker}")
-        return [e.title for e in feed.entries], feed
+        return ticker, feed
 
     def aggregate_sentiment(self, tickers: list):
-        """Return mean sentiment per ticker and feeds dict."""
-        scores, feeds = {}, {}
-        for t in tickers:
-            titles, feed = self.fetch_headlines(t)
-            feeds[t] = feed
-            if titles:
-                vals = self._score_texts(titles)
-                scores[t] = float(np.mean(vals))
-            else:
-                scores[t] = 0.0
-        return scores, feeds
+        """
+        Fetches headlines concurrently and performs sentiment scoring in batches.
+        """
+        all_entries = []
+        feeds = {}
+        
+        # 1. CONCURRENCY: Fetch all feeds in parallel using threads
+        # Threads are ideal for I/O-bound tasks like network requests
+        with ThreadPoolExecutor(max_workers=min(32, len(tickers) * 2 + 4)) as executor:
+            future_to_ticker = {executor.submit(self._fetch_single_feed, t): t for t in tickers}
+            
+            # Retrieve results as they complete
+            for future in as_completed(future_to_ticker):
+                ticker, feed = future.result()
+                feeds[ticker] = feed
 
+        # 2. BATCH SCORING: Process all entries from all tickers
+        # This is where the model is loaded and run, optimizing for speed
+        
+        # Collect ALL titles from ALL fetched feeds into one list
+        all_titles = []
+        entry_list_map = [] # Map entries back to their data later
+        
+        for t in tickers:
+            feed = feeds[t]
+            for entry in feed.entries:
+                all_titles.append(entry.title)
+                entry_list_map.append({
+                    "Ticker": t,
+                    "Title": entry.title,
+                    "Link": entry.link,
+                    "Published": entry.published,
+                })
+        
+        # Run one HUGE batch inference for maximum efficiency
+        if all_titles:
+            all_scores = self._score_texts(all_titles)
+        else:
+            all_scores = np.array([])
+            
+        # 3. COMBINE: Match scores back to the entry data
+        for i, entry_data in enumerate(entry_list_map):
+            score = float(all_scores[i]) if i < len(all_scores) else 0.0
+            entry_data["Sentiment"] = score
+            all_entries.append(entry_data)
+            
+        return all_entries, feeds
+
+    # build_dataframe logic remains largely the same, but it's now incredibly fast 
+    # because aggregate_sentiment does all the heavy lifting in parallel/batches.
     def build_dataframe(self, tickers: list) -> pd.DataFrame:
         """
-        Build a dataframe of headlines with per-title sentiment,
-        plus daily aggregated sentiment per ticker.
+        Build a dataframe by calling aggregate_sentiment once for batch processing.
         """
-        scores, feeds = self.aggregate_sentiment(tickers)
-
-        items = []
-        for ticker in tickers:
-            for e in feeds[ticker].entries:
-                items.append({
-                    "Ticker": ticker,
-                    "Title": e.title,
-                    "Link": e.link,
-                    "Published": e.published,
-                    "Sentiment": self._score_single(e.title)
-                })
+        
+        # CALL BATCH SCORING ONCE
+        items, _ = self.aggregate_sentiment(tickers)
+        
         df = pd.DataFrame(items)
 
         if df.empty:
             return df, None
 
+        # --- Standard Pandas Processing ---
         df['Published'] = pd.to_datetime(df['Published'])
         df["Date"] = df["Published"].dt.date
 
@@ -245,7 +283,6 @@ class SentimentAnalyzer:
               .reset_index()
               .rename(columns={"Sentiment": "DailySentiment"})
         )
-
         sentiment_wide = df_daily.pivot(index='Date', columns='Ticker', values='DailySentiment')
 
         return df, sentiment_wide
@@ -368,7 +405,7 @@ class PipelineCoordinator:
     """
     Unified pipeline integrating:
      - ReturnPredictor (LightGBM/XGBoost)
-     - SentimentAnalyzer (FinBERT)
+     - SentimentAnalyzer (FinBERT) (Calculated Outside Pipeline)
      - RegimeDetector (HMM/GMM)
      - RiskForecaster (GARCH + rolling covariance)
      - RLAgent (PPO, optional)
@@ -474,23 +511,19 @@ class PipelineCoordinator:
         exp_rets, cov, exp_vols = self.return_predictor.predict(macro_df=macro_df)
         results['forecaster'] = {'expected_returns': exp_rets, 'covariance': cov, "expected_volatility":exp_vols}
 
-        # 2. Sentiment
-        df_sentiment, sentiment_wide = self.sentiment_analyzer.build_dataframe(self.tickers)
-        results['sentiment'] = {'df': df_sentiment, 'daily_pivot': sentiment_wide}
-
-        # 3. Regime detection
+        # 2. Regime detection
         if feature_matrix is not None:
             regimes = self.regime_detector.predict(feature_matrix)
             results['regime'] = regimes
         else:
             results['regime'] = None
 
-        # 4. Risk forecasting
+        # 3. Risk forecasting
         rolling_cov = self.risk_forecaster.rolling_covariance(price_df)
         per_asset_vol = {t: self.risk_forecaster.forecast_volatility(t) for t in self.tickers}
         results['risk'] = {'rolling_cov': rolling_cov, 'per_asset_vol': per_asset_vol}
 
-        # 5. Optional RL agent
+        # 4. Optional RL agent
         if self.use_rl and env is not None:
             self.train_rl(env, total_timesteps=rl_timesteps)
             results['rl_agent'] = self.rl_agent
