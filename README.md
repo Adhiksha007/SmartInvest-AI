@@ -80,4 +80,6 @@ See `requirements.txt` for a complete list of dependencies. Key libraries includ
 ## Acknowledgments
 
 - This project was developed for Hackathon Purpose
-- Special thanks to [Any acknowledgments]
+
+## Deployment 
+- Link: https://smartinvest-ai.streamlit.app/
